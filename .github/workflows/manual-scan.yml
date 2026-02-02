@@ -1,0 +1,112 @@
+name: Manual Vulnerability Scan & Report
+
+on:
+  workflow_dispatch:
+
+
+jobs:
+  scan-and-report:
+    name: Scan for Vulnerabilities and Email Report
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # SARIF report for GitHub Security tab
+      - name: Run Trivy vulnerability scanner (SARIF)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-results.sarif
+
+      # Manually install Trivy CLI
+      - name: Install Trivy CLI
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+
+      
+      
+      # Text table report for email/AI (run Trivy CLI directly)
+      - name: Run Trivy vulnerability scanner (table)
+        run: |
+            export TRIVY_DISABLE_VEX_NOTICE=true 
+            trivy fs --scanners vuln --severity HIGH,CRITICAL --format table --output trivy-report.txt .
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Generate AI Report with Gemini
+        if: always()
+        id: gemini
+        run: |
+          TRIVY_REPORT=$(cat trivy-report.txt)
+
+          JSON_PAYLOAD=$(jq -n \
+            --arg report "$TRIVY_REPORT" \
+            '{
+              "contents": [
+                {
+                  "parts": [
+                    {
+                      "text": "You are a senior cybersecurity analyst. Your job is to analyze this Trivy vulnerability report and provide a clear, actionable summary for a developer. \n\nHere is the report:\n\n\($report)"
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          GEMINI_RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=$GEMINI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+          if echo "$GEMINI_RESPONSE" | grep -q "error"; then
+            echo "GEMINI_REPORT=Error analyzing vulnerabilities." >> $GITHUB_OUTPUT
+            echo "Error generating Gemini report. Check workflow logs." > gemini-report.md
+            echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"
+            echo "GEMINI RESPONSE---------------------"
+            echo "$GEMINI_RESPONSE"
+            echo "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"
+            echo "JSON PAYLOAD  ---------------------"
+            echo "$JSON_PAYLOAD"
+
+          else
+            GEMINI_TEXT=$(echo "$GEMINI_RESPONSE" | jq -r '.candidates[0].content.parts[0].text')
+            echo "$GEMINI_TEXT" | sed 's/^ *//' > gemini-report.md
+          fi
+
+
+      # - name: Convert Markdown to HTML
+      #   run: |
+      #     pip install markdown
+      #     python -c "import markdown, sys; print(markdown.markdown(open('gemini-report.md').read()))" > gemini-report.html
+
+      - name: Send Vulnerability Report Email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Vulnerability Scan Report for ${{ github.repository }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: "GitHub Actions <${{ secrets.MAIL_USERNAME }}>"
+          html_body: file://gemini-report.md
+          convert_markdown: true
+          attachments: trivy-report.txt
